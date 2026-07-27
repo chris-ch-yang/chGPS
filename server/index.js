@@ -4,7 +4,8 @@ import {
   listDevices,
   developerModeEnabled,
   mountedImages,
-  tunneldRunning,
+  tunnelForDevice,
+  activeSimulationCoord,
   mountDeveloperImage,
   setLocation,
   clearLocation,
@@ -46,13 +47,14 @@ async function collectStatus() {
   const iosMajor = majorVersion(device.ProductVersion)
   const needsTunnel = iosMajor >= 17
 
-  const [devMode, images, tunnel] = await Promise.all([
+  const [devMode, images, tunnelInfo] = await Promise.all([
     developerModeEnabled(),
     mountedImages(),
-    needsTunnel ? tunneldRunning() : Promise.resolve(null)
+    needsTunnel ? tunnelForDevice(device.UniqueDeviceID) : Promise.resolve(null)
   ])
 
   const ddiMounted = Array.isArray(images) ? images.length > 0 : null
+  const tunnel = tunnelInfo ? tunnelInfo.tunnel : null
 
   const blockers = []
   if (devMode === false) {
@@ -70,7 +72,9 @@ async function collectStatus() {
   if (needsTunnel && tunnel === false) {
     blockers.push({
       code: 'NO_TUNNEL',
-      message: `iOS ${iosMajor} 需要 RemoteXPC tunnel（tunneld 未在 127.0.0.1:${TUNNELD_PORT} 回應）。`
+      message: tunnelInfo?.daemon
+        ? `tunneld 有在跑，但沒有連到這台裝置的 tunnel。請重啟 tunneld。`
+        : `iOS ${iosMajor} 需要 RemoteXPC tunnel（tunneld 未在 127.0.0.1:${TUNNELD_PORT} 回應）。`
     })
   }
 
@@ -89,7 +93,8 @@ async function collectStatus() {
     tunnel,
     needsTunnel,
     ready: blockers.length === 0,
-    blockers
+    blockers,
+    simulating: activeSimulationCoord()
   }
 }
 
@@ -128,7 +133,8 @@ app.post('/api/location', async (req, res) => {
   const status = statusCache.data || (await collectStatus())
   const legacy = status.connected && status.iosMajor > 0 && status.iosMajor < 17
 
-  const result = await setLocation(lat, lng, { legacy })
+  const result = await setLocation(lat, lng, { legacy, udid: status.device?.udid })
+  statusCache = { at: 0, data: null }
   if (result.ok) {
     return res.json({ ok: true, lat, lng, mode: legacy ? 'lockdown' : 'dvt' })
   }
@@ -140,6 +146,7 @@ app.post('/api/location/clear', async (req, res) => {
   const legacy = status.connected && status.iosMajor > 0 && status.iosMajor < 17
 
   const result = await clearLocation({ legacy })
+  statusCache = { at: 0, data: null }
   if (result.ok) return res.json({ ok: true })
   res.status(502).json({ error: result.error })
 })

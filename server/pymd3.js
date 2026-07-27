@@ -115,16 +115,24 @@ export async function mountedImages() {
   return parseJson(r.stdout) || []
 }
 
-/** tunneld exposes an HTTP endpoint; reachability is the cheapest liveness probe. */
-export async function tunneldRunning() {
+/**
+ * tunneld being reachable is not enough — it can be up with no tunnel to our
+ * device. Its index returns { <udid>: [{ tunnel-address, tunnel-port, ... }] },
+ * so confirm the specific UDID is present.
+ */
+export async function tunnelForDevice(udid) {
   try {
     const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), 1500)
+    const t = setTimeout(() => ctrl.abort(), 2000)
     const res = await fetch(`http://127.0.0.1:${TUNNELD_PORT}/`, { signal: ctrl.signal })
     clearTimeout(t)
-    return res.ok
+    if (!res.ok) return { daemon: false, tunnel: false }
+
+    const map = await res.json()
+    const entries = udid ? map?.[udid] : Object.values(map || {})[0]
+    return { daemon: true, tunnel: Array.isArray(entries) && entries.length > 0 }
   } catch {
-    return false
+    return { daemon: false, tunnel: false }
   }
 }
 
@@ -138,28 +146,148 @@ export async function mountDeveloperImage() {
 }
 
 /**
- * Set the simulated GPS coordinate.
- * iOS 17+ routes through DVT; older devices use the legacy lockdown service.
+ * On iOS 17+ the DVT session owns the simulation: `simulate-location set`
+ * applies the coordinate, prints "Press ENTER to exit", then blocks. The
+ * override lives only as long as that process does, so the process is kept
+ * alive and tracked here rather than awaited to completion.
+ *
+ * Its stdin must stay open — closing it sends EOF, the prompt reads it as
+ * "exit", and the simulation is torn down immediately.
  */
-export async function setLocation(lat, lng, { legacy = false } = {}) {
-  const base = legacy
-    ? ['developer', 'simulate-location', 'set']
-    : ['developer', 'dvt', 'simulate-location', 'set']
+let activeSimulation = null
 
-  // `--` guards against a negative longitude being parsed as an option.
-  const r = await run([...base, '--', String(lat), String(lng)], { timeout: 90000 })
-  if (r.ok) return { ok: true }
-  return { ok: false, error: classifyError(r) }
+function killTree(child) {
+  try {
+    if (process.platform === 'win32' && child.pid) {
+      // `python -m pymobiledevice3` runs as a parent/child pair, and on Windows
+      // killing the parent orphans the child, which keeps holding the device.
+      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+    } else {
+      child.kill()
+    }
+  } catch {
+    // already gone
+  }
+}
+
+function stopActiveSimulation() {
+  if (!activeSimulation) return false
+  const { child } = activeSimulation
+  activeSimulation = null
+  killTree(child)
+  return true
+}
+
+export function activeSimulationCoord() {
+  return activeSimulation ? { lat: activeSimulation.lat, lng: activeSimulation.lng } : null
+}
+
+/** Applied-and-holding signal printed by pymobiledevice3 once the coord lands. */
+const HOLD_PROMPT = /Press ENTER to exit/i
+
+/** Grace period after which a still-running process is taken as holding. */
+const HOLD_GRACE_MS = 15000
+const HOLD_HARD_TIMEOUT_MS = 90000
+
+function setLocationDvt(lat, lng, udid) {
+  return new Promise((resolve) => {
+    const args = ['-m', 'pymobiledevice3', 'developer', 'dvt', 'simulate-location', 'set']
+    // Without --tunnel the CLI ignores a running tunneld and spins up its own
+    // userspace tunnel, which is slow and often stalls.
+    if (udid) args.push('--tunnel', udid)
+    // `--` guards against a negative longitude being parsed as an option.
+    args.push('--', String(lat), String(lng))
+
+    const child = spawn(PYTHON, args, {
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // The hold prompt has no trailing newline, so a buffered Python would
+      // never flush it down the pipe and the success signal would be missed.
+      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    })
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+
+    const succeed = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(hardTimer)
+      clearTimeout(graceTimer)
+      activeSimulation = { child, lat, lng }
+      resolve({ ok: true })
+    }
+
+    const fail = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(hardTimer)
+      clearTimeout(graceTimer)
+      resolve(result)
+    }
+
+    const hardTimer = setTimeout(() => {
+      killTree(child)
+      fail({ ok: false, error: classifyError({ stdout, stderr, timedOut: true }) })
+    }, HOLD_HARD_TIMEOUT_MS)
+
+    // Fallback for when the prompt never reaches us: a process that is still
+    // alive and quiet at this point has applied the coordinate and is holding.
+    const graceTimer = setTimeout(() => {
+      if (child.exitCode === null && !/error|traceback/i.test(stderr)) succeed()
+    }, HOLD_GRACE_MS)
+
+    child.stdout.on('data', (d) => {
+      stdout += d
+      if (HOLD_PROMPT.test(stdout)) succeed()
+    })
+
+    child.stderr.on('data', (d) => { stderr += d })
+
+    child.on('error', (err) => {
+      fail({ ok: false, error: { code: 'SPAWN_FAILED', message: err.message } })
+    })
+
+    // Exiting before the hold state means the coordinate never took.
+    child.on('close', (code) => {
+      if (activeSimulation?.child === child) activeSimulation = null
+      fail({ ok: false, error: classifyError({ stdout, stderr, code }) })
+    })
+  })
+}
+
+export async function setLocation(lat, lng, { legacy = false, udid } = {}) {
+  stopActiveSimulation()
+
+  if (legacy) {
+    // Pre-17 devices persist the override server-side, so the command exits.
+    const r = await run(['developer', 'simulate-location', 'set', '--', String(lat), String(lng)], {
+      timeout: 60000
+    })
+    return r.ok ? { ok: true } : { ok: false, error: classifyError(r) }
+  }
+
+  return setLocationDvt(lat, lng, udid)
 }
 
 export async function clearLocation({ legacy = false } = {}) {
-  const base = legacy
-    ? ['developer', 'simulate-location', 'clear']
-    : ['developer', 'dvt', 'simulate-location', 'clear']
+  if (legacy) {
+    const r = await run(['developer', 'simulate-location', 'clear'], { timeout: 60000 })
+    return r.ok ? { ok: true } : { ok: false, error: classifyError(r) }
+  }
 
-  const r = await run([...base], { timeout: 60000 })
-  if (r.ok) return { ok: true }
-  return { ok: false, error: classifyError(r) }
+  // Ending the DVT session is what restores real GPS on iOS 17+.
+  stopActiveSimulation()
+  return { ok: true }
+}
+
+// Don't leave a stray python process holding the device after the bridge dies.
+for (const sig of ['exit', 'SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    stopActiveSimulation()
+    if (sig !== 'exit') process.exit(0)
+  })
 }
 
 export { run, classifyError, TUNNELD_PORT }

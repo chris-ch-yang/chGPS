@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File start.ps1",
     "dev": "vite",
     "server": "node server/index.js",
     "tunnel": "python -m pymobiledevice3 remote tunneld",

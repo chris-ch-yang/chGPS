@@ -3,6 +3,11 @@
 在網頁地圖上點一個位置，透過 USB 把該座標寫進 iPhone，讓系統與 App 認為裝置在該地點。
 底層使用 [`pymobiledevice3`](https://github.com/doronz88/pymobiledevice3)，走的是 Xcode「Simulate Location」同一個 Apple 官方開發者服務。
 
+## 快速啟動
+
+雙擊 **`start.cmd`**（或 `npm start`）。腳本會自行提權，依序拉起 tunneld、bridge、
+Web UI，並開啟瀏覽器。**關掉那個視窗，三個服務全部一起停**。
+
 ## 架構
 
 ```
@@ -10,10 +15,36 @@ React + Leaflet (:3000)
       │  POST /api/location {lat, lng}
       ▼
 Node/Express bridge (:4000)
-      │  spawn: python -m pymobiledevice3 developer dvt simulate-location set
+      │  spawn 長駐行程:
+      │  pymobiledevice3 developer dvt simulate-location set --tunnel <udid>
       ▼
-RemoteXPC tunnel (iOS 17+) ──USB──▶ iPhone
+RemoteXPC tunneld (:49151) ──USB──▶ iPhone
 ```
+
+### 為什麼是「長駐行程」
+
+iOS 17+ 的模擬定位由 DVT session 持有：`simulate-location set` 送出座標後印出
+`Press ENTER to exit` 就**停在那裡不結束**，session 一斷、定位就還原。因此 bridge
+不是「執行完就收工」，而是把該行程留著並記錄下來，換座標時先砍舊的再開新的，
+「還原真實 GPS」則單純就是砍掉它。
+
+實作上有三個必要細節：
+
+- **一定要傳 `--tunnel <udid>`**。否則 CLI 會忽略已在跑的 tunneld，自己另開一條
+  userspace tunnel，既慢又常卡住。
+- **`PYTHONUNBUFFERED=1`**。那句提示沒有換行，Python 在管線模式下會把它留在緩衝區，
+  父行程永遠讀不到成功訊號。另外也保留一個「存活即視為成功」的寬限判定作後備。
+- **樹狀終止**。`python -m pymobiledevice3` 是父子兩個行程，Windows 上砍父的不會
+  連帶砍子的，孤兒會繼續佔住裝置。
+
+### 為什麼啟動腳本用 Job Object
+
+需求是「關視窗就全部停掉」。PowerShell 的 `finally` 或 Ctrl+C handler 擋不住視窗的
+X 按鈕，所以改用 Windows Job Object 搭配 `KILL_ON_JOB_CLOSE`：所有子行程掛在同一個
+job 上，父行程一消失（正常結束、Ctrl+C、被強制終止都算）核心就會清掉整組。
+
+> `start.ps1` 必須存成 **UTF-8 with BOM**。Windows PowerShell 5.1 在沒有 BOM 時會以
+> 系統 ANSI codepage 讀檔，中文字會被拆成無效位元組而產生假的語法錯誤。
 
 ## 已驗證環境
 
@@ -55,25 +86,35 @@ python -m pymobiledevice3 mounter auto-mount
 
 iOS 17+ 會從 Apple 下載 personalized DDI，需要連網，約數分鐘。
 
-### 3. 啟動 RemoteXPC tunnel（iOS 17+ 必要）
-
-需要**系統管理員權限**（要建立 TUN 介面）。開一個 Administrator PowerShell：
-
-```bash
-python -m pymobiledevice3 remote tunneld
-```
-
-保持這個視窗開著。tunneld 會在 `127.0.0.1:49151` 提供服務，bridge 會自動偵測。
-
-**無管理員權限的替代方案** — 使用 userspace tunnel（速度較慢但免提權）：
-
-```bash
-python -m pymobiledevice3 remote tunneld --userspace
-```
+> 前置需求 3（tunnel）由 `start.cmd` 自動處理，不需要手動開。
 
 ## 啟動
 
-三個終端機：
+```bash
+npm start
+```
+
+或直接雙擊 `start.cmd`。會依序啟動並顯示進度：
+
+```
+  chGPS — 地圖選點改 iPhone 定位
+  ────────────────────────────────────────────
+
+  [1/3] RemoteXPC tunneld ... OK
+  [2/3] Bridge (:4000)     ... OK
+  [3/3] Web UI (:3000)     ... OK
+
+  裝置  iPhone · iOS 26.5.2
+  狀態  就緒，可傳送定位
+```
+
+**關閉視窗或按 Ctrl+C 即停止全部服務。**
+
+啟動時也會自動清掉前次殘留的 `simulate-location` 行程（那會佔住裝置導致下次失敗）。
+
+### 手動分開啟動
+
+除錯時想個別看 log：
 
 ```bash
 npm run tunnel
@@ -85,6 +126,12 @@ npm run server
 
 ```bash
 npm run dev
+```
+
+`npm run tunnel` 需要**系統管理員權限**。無提權需求的替代方案（較慢）：
+
+```bash
+python -m pymobiledevice3 remote tunneld --userspace
 ```
 
 開啟 http://localhost:3000
@@ -116,11 +163,16 @@ npm run dev
 | `未偵測到 iPhone` | 解鎖螢幕、確認已點「信任這台電腦」、換條支援資料傳輸的線 |
 | `開發者模式未啟用` | 見前置需求 1 |
 | `DDI 未掛載` | 見前置需求 2；需連網 |
-| `tunneld 未回應` | 見前置需求 3；tunneld 需以管理員身分執行且保持運作 |
+| `tunneld 未回應` | 重跑 `start.cmd`；手動啟動時 tunneld 需以管理員身分執行並保持運作 |
+| `tunneld 有在跑，但沒有連到這台裝置的 tunnel` | 拔插 USB 後重啟 tunneld — 裝置重連後舊 tunnel 不會自動接回 |
+| 傳送逾時 | 檢查 tunneld 是否還活著；`--tunnel` 沒生效時 CLI 會退回自建 userspace tunnel 而卡住 |
 | 定位沒變 | 部分 App 會快取位置，重啟該 App；地圖類 App 通常即時反應 |
 
 ## 注意
 
-- 模擬定位在 iPhone **重新開機後失效**，需重新設定。
+- **模擬定位只在 bridge 持有 session 期間有效。** 關閉啟動視窗、bridge 當掉、或按下
+  「還原真實 GPS」都會立即還原。這是 iOS 17+ DVT 的設計，不是缺陷。
+- iPhone **重新開機**同樣會清除模擬定位。
+- 每次只能有一個模擬座標；設定新座標會自動取代舊的。
 - 這使用的是 Apple 官方開發者服務，**不需要越獄**，也不會修改系統檔案。
 - 僅適用於自己擁有、且已配對信任的裝置。
