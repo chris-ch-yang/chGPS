@@ -1,0 +1,27 @@
+{
+  "name": "chgps",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "server": "node server/index.js",
+    "tunnel": "python -m pymobiledevice3 remote tunneld",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.0.4",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "leaflet": "^1.9.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-leaflet": "^5.0.0",
+    "vite": "^8.1.5"
+  }
+}
